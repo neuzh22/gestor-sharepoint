@@ -82,6 +82,19 @@ flowchart LR
 
 ## 📥 Instalación
 
+### Opción A: ejecutable, sin instalar nada (recomendado)
+
+1. Copia **`SP-Migrar.exe`** a una carpeta del equipo, por ejemplo `C:\SP-Migrar\`.
+2. Haz doble clic. Listo.
+
+No necesita Python. La configuración, la sesión, los trabajos y los logs se guardan **en la misma carpeta del `.exe`**, así que elige una carpeta donde tengas permiso de escritura (no `C:\Program Files`).
+
+> 🛠️ Para generar el `.exe` tú mismo, ejecuta **`compilar.bat`** en un equipo con Python. El resultado queda en `dist\SP-Migrar.exe`.
+
+> ⚠️ Windows SmartScreen puede advertir *"Windows protegió su PC"*, porque el ejecutable no está firmado. Pulsa **Más información → Ejecutar de todas formas**.
+
+### Opción B: con Python
+
 **Requisitos:** Windows 10/11, [Python 3.10+](https://www.python.org/downloads/) (marca *"Add Python to PATH"* al instalar) y una cuenta de Microsoft 365 con acceso al sitio.
 
 ```powershell
@@ -95,6 +108,8 @@ pip install -r requirements.txt
 ## 🚀 Uso
 
 ### 1. Abrir el programa
+
+Haz doble clic en **`SP-Migrar.exe`**, o con Python:
 
 ```powershell
 python sp_migrar.py        # o doble clic en iniciar.bat
@@ -154,9 +169,10 @@ Lo descargado queda así:
 Usa la opción **2** del menú, o ejecútalo directamente:
 
 ```powershell
-python sp_migrar.py --trabajo NOMBRE_DEL_TRABAJO
-python sp_migrar.py --trabajo NOMBRE_DEL_TRABAJO --solo-fallidos
-python sp_migrar.py --trabajo NOMBRE_DEL_TRABAJO --hilos 8
+SP-Migrar.exe --trabajo NOMBRE_DEL_TRABAJO
+SP-Migrar.exe --trabajo NOMBRE_DEL_TRABAJO --solo-fallidos
+SP-Migrar.exe --trabajo NOMBRE_DEL_TRABAJO --hilos 8
+# (con Python: python sp_migrar.py --trabajo ...)
 ```
 
 Lo que ya está copiado y no cambió se **omite**. Solo baja lo nuevo, lo modificado o lo que falló.
@@ -229,8 +245,8 @@ Así la copia no depende de la sesión de ninguna persona.
 En el Programador de tareas de Windows crea una acción con:
 
 ```text
-Programa:   python
-Argumentos: "D:\ruta\sp_migrar.py" --trabajo NOMBRE_DEL_TRABAJO
+Programa:   C:\SP-Migrar\SP-Migrar.exe
+Argumentos: --trabajo NOMBRE_DEL_TRABAJO
 ```
 
 Usa una **ruta UNC** como destino, porque las unidades mapeadas (`Z:`) no existen dentro de las tareas programadas. Además, inicia sesión al menos una vez de forma interactiva antes.
@@ -239,7 +255,8 @@ Usa una **ruta UNC** como destino, porque las unidades mapeadas (`Z:`) no existe
 
 ```text
 ├── sp_migrar.py          # Programa principal
-├── iniciar.bat           # Lanzador con doble clic
+├── iniciar.bat           # Lanzador con doble clic (versión Python)
+├── compilar.bat          # Genera dist\SP-Migrar.exe (no requiere Python para usarlo)
 ├── requirements.txt      # Dependencias (msal, requests)
 ├── config.example.json   # Plantilla de configuración
 │

@@ -41,7 +41,8 @@ except ImportError:
     print("Faltan dependencias. Ejecuta:  pip install -r requirements.txt")
     sys.exit(1)
 
-BASE = os.path.dirname(os.path.abspath(__file__))
+# Empaquetado como .exe (PyInstaller): los datos van junto al ejecutable, no en la carpeta temporal.
+BASE = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
 DIR_TRABAJOS = os.path.join(BASE, "trabajos")
 DIR_LOGS = os.path.join(BASE, "logs")
 DIR_REPORTES = os.path.join(BASE, "reportes")
@@ -1346,4 +1347,12 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        # Con doble clic en el .exe la ventana se cerraría sin dejar leer el error.
+        import traceback
+        traceback.print_exc()
+        if getattr(sys, "frozen", False):
+            input("\nOcurrió un error inesperado. Presiona Enter para cerrar...")
+        sys.exit(1)

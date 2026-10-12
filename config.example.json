@@ -1,0 +1,14 @@
+{
+  "tenant": "organizations",
+  "client_id": "14d82eec-204b-4c2f-b7e8-296a70dab67e",
+  "client_secret": "",
+  "hilos": 4,
+  "reintentos_peticion": 8,
+  "reintentos_archivo": 5,
+  "pasadas_reintento": 3,
+  "espera_entre_pasadas_seg": 300,
+  "timeout_lectura_seg": 120,
+  "intervalo_estado_seg": 60,
+  "incluir_carpeta_sitio": true,
+  "evitar_suspension": true
+}

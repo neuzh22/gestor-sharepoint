@@ -1,0 +1,25 @@
+# Sesión de Microsoft (contiene tokens: NUNCA subir)
+token_cache.bin
+token_cache.bin.tmp
+
+# Configuración local (puede contener client_secret). Usa config.example.json como plantilla.
+config.json
+
+# Datos generados en cada uso
+trabajos/
+logs/
+reportes/
+*.sppart
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Sistema / editores
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+.DS_Store

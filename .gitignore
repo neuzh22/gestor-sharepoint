@@ -28,3 +28,8 @@ Desktop.ini
 build/
 dist/
 *.spec
+
+# FFmpeg (100 MB; se descarga aparte, ver README)
+ffmpeg/
+ffmpeg.exe
+*.spcomp.*

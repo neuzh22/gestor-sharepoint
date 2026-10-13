@@ -27,6 +27,7 @@ import re
 import shutil
 import signal
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -69,7 +70,13 @@ CFG_DEFECTO = {
     "intervalo_estado_seg": 60,
     "incluir_carpeta_sitio": True,
     "evitar_suspension": True,
+    "comprimir_imagenes": True,
+    "calidad_imagenes": 65,
+    "ffmpeg_ruta": "",
 }
+
+# Formatos que se recomprimen conservando la extensión (para no romper enlaces ni nombres).
+EXT_IMAGEN = {".jpg": "jpeg", ".jpeg": "jpeg", ".jfif": "jpeg", ".png": "png", ".webp": "webp"}
 
 ERRORES_RED = (
     requests.exceptions.ConnectionError,
@@ -512,26 +519,43 @@ class Estado:
                     drive_id TEXT, item_id TEXT, drive_nombre TEXT, ruta TEXT, error TEXT, actualizado TEXT,
                     PRIMARY KEY(drive_id, item_id));
             """)
+            columnas = {f["name"] for f in self.c.execute("PRAGMA table_info(archivos)")}
+            if "comprimida" not in columnas:  # trabajos creados antes de la compresión de imágenes
+                self.c.execute("ALTER TABLE archivos ADD COLUMN comprimida INTEGER DEFAULT 0")
+                self.c.commit()
 
     def get(self, drive_id, item_id):
         with self.l:
             return self.c.execute("SELECT * FROM archivos WHERE drive_id=? AND item_id=?",
                                   (drive_id, item_id)).fetchone()
 
-    def archivo(self, drive_id, it, drive_nombre, ruta_remota, ruta_local, estado, tamano_local=None, error=None):
+    def archivo(self, drive_id, it, drive_nombre, ruta_remota, ruta_local, estado, tamano_local=None, error=None,
+                comprimida=0):
         with self.l:
             self.c.execute("""
                 INSERT INTO archivos(drive_id,item_id,drive_nombre,ruta_remota,ruta_local,tamano,mtime_remoto,
-                                     estado,tamano_local,intentos,error,actualizado)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                                     estado,tamano_local,intentos,error,actualizado,comprimida)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(drive_id,item_id) DO UPDATE SET
                     drive_nombre=excluded.drive_nombre, ruta_remota=excluded.ruta_remota,
                     ruta_local=excluded.ruta_local, tamano=excluded.tamano, mtime_remoto=excluded.mtime_remoto,
                     estado=excluded.estado, tamano_local=excluded.tamano_local,
                     intentos=archivos.intentos + excluded.intentos, error=excluded.error,
-                    actualizado=excluded.actualizado
+                    actualizado=excluded.actualizado, comprimida=excluded.comprimida
             """, (drive_id, it["id"], drive_nombre, ruta_remota, ruta_local, it.get("size"), fecha_remota(it),
-                  estado, tamano_local, 1 if estado == "error" else 0, error, ahora()))
+                  estado, tamano_local, 1 if estado == "error" else 0, error, ahora(), comprimida))
+            self.c.commit()
+
+    def imagenes_sin_comprimir(self):
+        with self.l:
+            filas = self.c.execute("SELECT * FROM archivos WHERE estado='ok' AND COALESCE(comprimida,0)=0 "
+                                   "ORDER BY ruta_local").fetchall()
+        return [f for f in filas if os.path.splitext(f["ruta_local"] or "")[1].lower() in EXT_IMAGEN]
+
+    def marcar_comprimida(self, drive_id, item_id, tamano_local):
+        with self.l:
+            self.c.execute("UPDATE archivos SET comprimida=1, tamano_local=?, actualizado=? "
+                           "WHERE drive_id=? AND item_id=?", (tamano_local, ahora(), drive_id, item_id))
             self.c.commit()
 
     def carpeta_error(self, drive_id, item_id, drive_nombre, ruta, error):
@@ -571,6 +595,7 @@ class Stats:
         self.inicio = time.time()
         self.ok = self.omitidos = self.errores = self.eliminados = self.descubiertos = 0
         self.bytes = 0
+        self.comprimidas = self.ahorro = 0
 
     def sumar(self, **kw):
         with self.lock:
@@ -578,14 +603,93 @@ class Stats:
                 setattr(self, k, getattr(self, k) + v)
 
 
+# --------------------------------------------------------------------------- compresión de imágenes
+def buscar_ffmpeg(cfg):
+    candidatos = [cfg.get("ffmpeg_ruta") or "",
+                  os.path.join(BASE, "ffmpeg.exe"),
+                  os.path.join(BASE, "ffmpeg", "ffmpeg.exe"),
+                  os.path.join(BASE, "ffmpeg", "bin", "ffmpeg.exe"),
+                  shutil.which("ffmpeg") or ""]
+    return next((c for c in candidatos if c and os.path.isfile(c)), None)
+
+
+def es_animada(ruta):
+    """WebP/PNG animados: recomprimirlos con un solo fotograma perdería la animación."""
+    try:
+        with open(lp(ruta), "rb") as f:
+            cabecera = f.read(65536)
+    except OSError:
+        return False
+    if cabecera[:4] == b"RIFF" and cabecera[8:12] == b"WEBP":
+        return b"ANIM" in cabecera
+    if cabecera[:8] == b"\x89PNG\r\n\x1a\n":
+        idat = cabecera.find(b"IDAT")
+        return b"acTL" in (cabecera[:idat] if idat > 0 else cabecera)
+    return False
+
+
+class Compresor:
+    """Recomprime JPG/PNG/WebP con FFmpeg conservando nombre y extensión.
+
+    La calidad (1-100) se aplica a JPEG (q:v de FFmpeg) y WebP; PNG es sin pérdida, solo se optimiza.
+    Solo reemplaza el archivo si el resultado es más pequeño.
+    """
+
+    def __init__(self, ffmpeg, calidad):
+        self.ffmpeg = ffmpeg
+        self.calidad = max(1, min(100, int(calidad)))
+        # Escala q:v de mjpeg: 2 (mejor) .. 31 (peor). Calidad 65 -> 10.
+        self.q_jpeg = max(2, min(31, round((100 - self.calidad) / 3.5)))
+
+    @staticmethod
+    def soporta(ruta):
+        return os.path.splitext(ruta)[1].lower() in EXT_IMAGEN
+
+    def comprimir(self, ruta):
+        """Devuelve el tamaño final. Lanza RuntimeError si FFmpeg falla (el original queda intacto)."""
+        ext = os.path.splitext(ruta)[1].lower()
+        tipo = EXT_IMAGEN[ext]
+        antes = os.path.getsize(lp(ruta))
+        if es_animada(ruta):
+            return antes
+        if tipo == "jpeg":
+            opciones = ["-c:v", "mjpeg", "-q:v", str(self.q_jpeg)]
+        elif tipo == "png":
+            opciones = ["-c:v", "png", "-pred", "mixed", "-compression_level", "9"]
+        else:
+            opciones = ["-c:v", "libwebp", "-quality", str(self.calidad), "-compression_level", "6"]
+
+        temporal = ruta + ".spcomp" + ext
+        ent, sal = (ruta, temporal) if len(temporal) < 240 else (lp(ruta), lp(temporal))
+        cmd = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", ent,
+               "-map", "0:v:0", "-frames:v", "1", *opciones, "-f", "image2", "-update", "1", sal]
+        try:
+            r = subprocess.run(cmd, capture_output=True, timeout=300,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            despues = os.path.getsize(lp(temporal)) if os.path.exists(lp(temporal)) else 0
+            if r.returncode != 0 or despues == 0:
+                detalle = r.stderr.decode("utf-8", "replace").strip().splitlines()
+                raise RuntimeError(detalle[-1] if detalle else f"FFmpeg terminó con código {r.returncode}")
+            if despues >= antes * 0.98:  # no vale la pena: se queda el original
+                return antes
+            os.replace(lp(temporal), lp(ruta))
+            return despues
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("FFmpeg tardó demasiado (más de 5 minutos)")
+        finally:
+            if os.path.exists(lp(temporal)):
+                os.remove(lp(temporal))
+
+
 # --------------------------------------------------------------------------- migrador
 class Migrador:
-    def __init__(self, trabajo, graph, estado, cfg, stop):
+    def __init__(self, trabajo, graph, estado, cfg, stop, compresor=None):
         self.t = trabajo
         self.g = graph
         self.db = estado
         self.cfg = cfg
         self.stop = stop
+        self.compresor = compresor
         self.stats = Stats()
         self.raiz = trabajo["destino"]
         self.base = (os.path.join(self.raiz, limpiar(trabajo["sitio_nombre"]))
@@ -606,7 +710,11 @@ class Migrador:
 
     def nas_disponible(self):
         try:
-            return os.path.isdir(lp(self.raiz))
+            if os.path.isdir(lp(self.raiz)):
+                return True
+            # La carpeta destino no existe (nueva o borrada): si el NAS responde, se crea; si no, está caído.
+            os.makedirs(lp(self.raiz), exist_ok=True)
+            return True
         except OSError:
             return False
 
@@ -802,15 +910,21 @@ class Migrador:
                     raise ErrorPermanente("No se pudo crear la carpeta de destino")
                 t0 = time.time()
                 final = self.bajar(drive_id, it["id"], local, tam)
+                bajado = final
+                comprimida, nota = 0, ""
+                if self.compresor and self.compresor.soporta(local):
+                    final, comprimida, nota = self.comprimir_local(local, ruta_remota)
+                elif final != tam:
+                    nota = f" (tamaño remoto {fmt_bytes(tam)}: normal en documentos Office)"
                 if mt:
                     try:
                         os.utime(lp(local), (mt, mt))
                     except OSError as e:
                         log.debug(f"No se pudo fijar la fecha de {local}: {e}")
-                self.db.archivo(drive_id, it, drive_nombre, ruta_remota, local, "ok", tamano_local=final)
+                self.db.archivo(drive_id, it, drive_nombre, ruta_remota, local, "ok", tamano_local=final,
+                                comprimida=comprimida)
                 self.stats.sumar(ok=1)
-                nota = "" if final == tam else f" (tamaño remoto {fmt_bytes(tam)}: normal en documentos Office)"
-                log.info(f"OK  {ruta_remota}  [{fmt_bytes(final)} en {time.time() - t0:.1f}s]{nota}")
+                log.info(f"OK  {ruta_remota}  [{fmt_bytes(bajado)} en {time.time() - t0:.1f}s]{nota}")
                 return
             except Detenido:
                 raise
@@ -838,6 +952,23 @@ class Migrador:
                 return
             log.warning(f"Reintento {intentos}/{maximo} de {ruta_remota}: {error}")
             self.g.dormir(min(15 * intentos, 120))
+
+    def comprimir_local(self, local, nombre):
+        """Comprime una imagen ya descargada. Devuelve (tamaño_final, estado_compresion, nota_para_log).
+
+        estado_compresion: 1 = procesada (comprimida o se dejó el original), 2 = FFmpeg falló (original intacto).
+        Un fallo de compresión nunca hace fallar la copia: la imagen original ya está a salvo.
+        """
+        antes = os.path.getsize(lp(local))
+        try:
+            despues = self.compresor.comprimir(local)
+        except Exception as e:
+            log.warning(f"No se pudo comprimir {nombre} (se conserva el original): {e}")
+            return antes, 2, "  · sin comprimir (error de FFmpeg)"
+        if despues < antes:
+            self.stats.sumar(comprimidas=1, ahorro=antes - despues)
+            return despues, 1, f"  · comprimida {fmt_bytes(antes)} -> {fmt_bytes(despues)} (-{100 - despues * 100 // antes}%)"
+        return antes, 1, "  · ya estaba optimizada"
 
     def bajar(self, drive_id, item_id, destino, esperado):
         """Descarga a un .sppart reanudable y lo renombra al terminar. Devuelve el tamaño final."""
@@ -908,8 +1039,9 @@ class Migrador:
         vel = s.bytes / trans if trans > 0 else 0
         with self.futuros_lock:
             cola = len(self.futuros)
+        imgs = f" | imágenes comprimidas {s.comprimidas} (ahorro {fmt_bytes(s.ahorro)})" if self.compresor else ""
         return (f"OK {s.ok} | omitidos {s.omitidos} | errores {s.errores} | descubiertos {s.descubiertos} | "
-                f"en cola {cola} | {fmt_bytes(s.bytes)} a {fmt_bytes(vel)}/s | {fmt_duracion(trans)}")
+                f"en cola {cola} | {fmt_bytes(s.bytes)} a {fmt_bytes(vel)}/s | {fmt_duracion(trans)}{imgs}")
 
     def _monitor(self):
         ultimo_titulo = 0
@@ -1193,6 +1325,18 @@ def nuevo_trabajo(cfg):
     print(f" Total aproximado: {fmt_bytes(total)}")
 
     destino = pedir_destino(total)
+
+    comprimir = False
+    if buscar_ffmpeg(cfg):
+        print("\n" + "=" * 78)
+        print(" COMPRESIÓN DE IMÁGENES")
+        print("=" * 78)
+        print(f"  Las imágenes JPG, PNG y WebP se pueden comprimir con FFmpeg al {cfg['calidad_imagenes']}% de calidad")
+        print("  al descargarlas (mantienen su nombre y extensión; ocupan bastante menos en el NAS).")
+        comprimir = si_no("\n  ¿Comprimir las imágenes?", bool(cfg["comprimir_imagenes"]))
+    else:
+        print("\n  (No se encontró ffmpeg.exe: las imágenes se copiarán sin comprimir.)")
+
     defecto = f"{limpiar(sitio.get('name') or sitio['displayName'])}_{dt.datetime.now():%Y%m%d_%H%M}"
     nombre = re.sub(r"[^\w\-]", "_", defecto)
     trabajo = {
@@ -1203,6 +1347,7 @@ def nuevo_trabajo(cfg):
         "destino": destino,
         "selecciones": [{k: s[k] for k in ("drive_id", "drive_nombre", "item_id", "ruta")} for s in sel],
         "tamano_estimado": total,
+        "comprimir_imagenes": comprimir,
         "creado": ahora(),
     }
     os.makedirs(DIR_TRABAJOS, exist_ok=True)
@@ -1216,8 +1361,22 @@ def nuevo_trabajo(cfg):
         print(f"   Carpeta:  {_ruta_legible(s)}")
     print(f"   Destino:  {carpeta_final}")
     print(f"   Tamaño:   {fmt_bytes(total)}")
+    print(f"   Imágenes: {'se comprimen al ' + str(cfg['calidad_imagenes']) + '% con FFmpeg' if comprimir else 'sin comprimir'}")
     print(f"\n   Si se interrumpe, la continúas desde el menú, opción 2 ('{nombre}').")
     return trabajo
+
+
+def crear_compresor(trabajo, cfg):
+    if not trabajo.get("comprimir_imagenes", cfg["comprimir_imagenes"]):
+        log.info("Compresión de imágenes: desactivada para este trabajo.")
+        return None
+    ffmpeg = buscar_ffmpeg(cfg)
+    if not ffmpeg:
+        log.warning("Compresión de imágenes: NO se encontró ffmpeg.exe (ponlo junto al programa o en el PATH). "
+                    "Las imágenes se copiarán sin comprimir.")
+        return None
+    log.info(f"Compresión de imágenes: ACTIVADA, calidad {cfg['calidad_imagenes']}% (JPG/PNG/WebP) con {ffmpeg}")
+    return Compresor(ffmpeg, cfg["calidad_imagenes"])
 
 
 def ejecutar_trabajo(trabajo, cfg, solo_fallidos=False):
@@ -1249,10 +1408,11 @@ def ejecutar_trabajo(trabajo, cfg, solo_fallidos=False):
             except ERRORES_RED as e:
                 g.esperar_red(e) or g.dormir(30)
         log.info(f"Conectado como {auth.usuario()}. Hilos de descarga: {cfg['hilos']}")
+        compresor = crear_compresor(trabajo, cfg)
         os.makedirs(DIR_TRABAJOS, exist_ok=True)
         db = Estado(os.path.join(DIR_TRABAJOS, f"{trabajo['nombre']}.db"))
         try:
-            detenido = Migrador(trabajo, g, db, cfg, stop).ejecutar(solo_fallidos)
+            detenido = Migrador(trabajo, g, db, cfg, stop, compresor).ejecutar(solo_fallidos)
             pendientes = len(db.fallidos()) + len(db.carpetas_fallidas())
         finally:
             db.cerrar()
@@ -1266,6 +1426,73 @@ def ejecutar_trabajo(trabajo, cfg, solo_fallidos=False):
     finally:
         evitar_suspension(False)
         signal.signal(signal.SIGINT, anterior)
+
+
+def comprimir_existentes(trabajo, cfg):
+    """Comprime las imágenes que un trabajo ya descargó sin comprimir (no se conecta a SharePoint)."""
+    ffmpeg = buscar_ffmpeg(cfg)
+    if not ffmpeg:
+        print(" No se encontró ffmpeg.exe. Ponlo junto al programa (o en la carpeta 'ffmpeg') e intenta de nuevo.")
+        return
+    ruta_db = os.path.join(DIR_TRABAJOS, f"{trabajo['nombre']}.db")
+    if not os.path.exists(ruta_db):
+        print(" Este trabajo aún no ha descargado nada.")
+        return
+    db = Estado(ruta_db)
+    try:
+        filas = db.imagenes_sin_comprimir()
+        if not filas:
+            print(" No hay imágenes pendientes de comprimir en este trabajo.")
+            return
+        total = sum(f["tamano_local"] or 0 for f in filas)
+        print(f"\n Imágenes sin comprimir: {len(filas)}  ({fmt_bytes(total)})  ->  calidad {cfg['calidad_imagenes']}%")
+        print(" Se reemplazan en el destino por su versión comprimida (solo si queda más pequeña).")
+        if not si_no(" ¿Continuar?"):
+            return
+        configurar_log(f"{trabajo['nombre']}_compresion")
+        compresor = Compresor(ffmpeg, cfg["calidad_imagenes"])
+        stats = Stats()
+
+        def una(f):
+            local = f["ruta_local"]
+            if not os.path.exists(lp(local)):
+                log.warning(f"No existe en el destino, se omite: {local}")
+                return
+            antes = os.path.getsize(lp(local))
+            try:
+                despues = compresor.comprimir(local)
+            except Exception as e:
+                log.warning(f"No se pudo comprimir {f['ruta_remota']}: {e}")
+                db.marcar_comprimida(f["drive_id"], f["item_id"], antes)
+                return
+            mt = a_timestamp(f["mtime_remoto"])
+            if mt:
+                try:
+                    os.utime(lp(local), (mt, mt))
+                except OSError:
+                    pass
+            db.marcar_comprimida(f["drive_id"], f["item_id"], despues)
+            stats.sumar(ok=1, comprimidas=int(despues < antes), ahorro=antes - despues)
+            if despues < antes:
+                log.info(f"OK  {f['ruta_remota']}  {fmt_bytes(antes)} -> {fmt_bytes(despues)} "
+                         f"(-{100 - despues * 100 // max(antes, 1)}%)")
+
+        pool = ThreadPoolExecutor(max(1, int(cfg["hilos"])), thread_name_prefix="comp")
+        futuros = [pool.submit(una, f) for f in filas]
+        try:
+            for i, fut in enumerate(futuros, 1):
+                fut.result()
+                if i % 100 == 0:
+                    log.info(f"[ESTADO] {i}/{len(filas)} revisadas | ahorro {fmt_bytes(stats.ahorro)}")
+        except KeyboardInterrupt:
+            log.warning("Detenido. Lo que falta se puede comprimir después con la misma opción.")
+            pool.shutdown(wait=True, cancel_futures=True)
+            return
+        pool.shutdown(wait=True)
+        log.info(f"Listo: {stats.comprimidas} imágenes comprimidas, ahorro total {fmt_bytes(stats.ahorro)} "
+                 f"({stats.ahorro * 100 // max(total, 1)}% de {fmt_bytes(total)}).")
+    finally:
+        db.cerrar()
 
 
 def ver_estado(trabajo):
@@ -1299,7 +1526,8 @@ def menu(cfg):
         print("  2) Continuar una descarga que se interrumpió")
         print("  3) Reintentar solo los fallidos de un trabajo")
         print("  4) Ver estado de un trabajo")
-        print("  5) Cerrar sesión de Microsoft")
+        print("  5) Comprimir imágenes ya descargadas (FFmpeg)")
+        print("  6) Cerrar sesión de Microsoft")
         print("  0) Salir")
         op = input(" > ").strip()
         try:
@@ -1316,6 +1544,10 @@ def menu(cfg):
                 if t:
                     ver_estado(t)
             elif op == "5":
+                t = elegir_trabajo()
+                if t:
+                    comprimir_existentes(t, cfg)
+            elif op == "6":
                 if os.path.exists(RUTA_TOKENS):
                     os.remove(RUTA_TOKENS)
                 print(" Sesión cerrada.")

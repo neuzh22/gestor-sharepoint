@@ -10,5 +10,8 @@
   "timeout_lectura_seg": 120,
   "intervalo_estado_seg": 60,
   "incluir_carpeta_sitio": true,
-  "evitar_suspension": true
+  "evitar_suspension": true,
+  "comprimir_imagenes": true,
+  "calidad_imagenes": 65,
+  "ffmpeg_ruta": ""
 }

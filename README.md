@@ -63,6 +63,7 @@ Eliges las carpetas y el destino, y lo dejas corriendo toda la noche: si se cae 
 | 🌙 **Desatendido** | Evita que el PC se suspenda y hace pasadas automáticas de reintento. |
 | 📊 **Trazable** | Guarda un log detallado y deja un reporte CSV de errores que se abre en Excel. |
 | 🗂️ **Fiel al original** | Respeta la estructura de carpetas y las fechas de modificación, y admite rutas de más de 260 caracteres. |
+| 🖼️ **Comprime imágenes** | Recomprime JPG, PNG y WebP con FFmpeg al 65% de calidad mientras descarga, y también las que ya bajaste. |
 
 ## 🔄 Cómo funciona
 
@@ -72,7 +73,8 @@ flowchart LR
     B --> C[📂 Elegir carpetas]
     C --> D[🎯 Elegir destino]
     D --> E[⬇️ Descarga en paralelo]
-    E --> F{¿Errores?}
+    E --> K[🖼️ Comprime imágenes<br/>FFmpeg 65%]
+    K --> F{¿Errores?}
     F -- No --> G[✅ Listo]
     F -- Sí --> H[🔁 Pasadas de reintento]
     H --> I[📄 Reporte CSV]
@@ -84,12 +86,12 @@ flowchart LR
 
 ### Opción A: ejecutable, sin instalar nada (recomendado)
 
-1. Copia **`SP-Migrar.exe`** a una carpeta del equipo, por ejemplo `C:\SP-Migrar\`.
-2. Haz doble clic. Listo.
+1. Copia **`SP-Migrar.exe`** y **`ffmpeg.exe`** a una misma carpeta del equipo, por ejemplo `C:\SP-Migrar\`.
+2. Haz doble clic en `SP-Migrar.exe`. Listo.
 
-No necesita Python. La configuración, la sesión, los trabajos y los logs se guardan **en la misma carpeta del `.exe`**, así que elige una carpeta donde tengas permiso de escritura (no `C:\Program Files`).
+No necesita Python. `ffmpeg.exe` solo hace falta para comprimir imágenes: sin él, todo lo demás funciona igual. La configuración, la sesión, los trabajos y los logs se guardan **en la misma carpeta del `.exe`**, así que elige una carpeta donde tengas permiso de escritura (no `C:\Program Files`).
 
-> 🛠️ Para generar el `.exe` tú mismo, ejecuta **`compilar.bat`** en un equipo con Python. El resultado queda en `dist\SP-Migrar.exe`.
+> 🛠️ Para generar el `.exe` tú mismo, ejecuta **`compilar.bat`** en un equipo con Python. El resultado queda en `dist\`. Si pusiste FFmpeg en `ffmpeg\ffmpeg.exe` (ver [Compresión de imágenes](#%EF%B8%8F-compresión-de-imágenes)), también se copia ahí.
 
 > ⚠️ Windows SmartScreen puede advertir *"Windows protegió su PC"*, porque el ejecutable no está firmado. Pulsa **Más información → Ejecutar de todas formas**.
 
@@ -123,7 +125,8 @@ python sp_migrar.py        # o doble clic en iniciar.bat
   2) Continuar una descarga que se interrumpió
   3) Reintentar solo los fallidos de un trabajo
   4) Ver estado de un trabajo
-  5) Cerrar sesión de Microsoft
+  5) Comprimir imágenes ya descargadas (FFmpeg)
+  6) Cerrar sesión de Microsoft
   0) Salir
 ```
 
@@ -198,6 +201,40 @@ Lo que ya está copiado y no cambió se **omite**. Solo baja lo nuevo, lo modifi
 
 **Códigos de salida:** `0` todo OK · `2` quedaron errores · `130` detenido por el usuario.
 
+## 🖼️ Compresión de imágenes
+
+Al crear una descarga, el programa pregunta **"¿Comprimir las imágenes?"**. Si respondes que sí, cada imagen se recomprime con FFmpeg justo después de descargarla:
+
+| Formato | Qué se hace |
+|---|---|
+| `.jpg` `.jpeg` `.jfif` | Se recomprime al **65% de calidad**. Suele ahorrar entre 40 y 60%. |
+| `.webp` | Se recomprime al **65% de calidad**. |
+| `.png` | Se optimiza **sin pérdida**, porque PNG no tiene calidad. Ahorra poco. |
+| Otros (`.gif`, `.heic`, `.tif`, documentos…) | Se copian tal cual. |
+
+```text
+OK  Fotos/playa.jpg  [99.56 KB en 0.9s]  · comprimida 99.56 KB -> 42.54 KB (-58%)
+```
+
+**Reglas de seguridad:**
+- Las imágenes conservan su **nombre y extensión**, así que no se rompen enlaces.
+- La imagen comprimida solo reemplaza a la original si **realmente pesa menos**.
+- Si FFmpeg falla con una imagen (dañada, CMYK…), **se conserva la original** y la copia sigue sin marcarse como error.
+- Los WebP y PNG **animados** no se tocan, para no perder la animación.
+- Las fotos giradas por EXIF (las de celular) **se guardan ya derechas**.
+- Al relanzar el trabajo, las imágenes ya comprimidas **no se vuelven a descargar**.
+
+> ⚠️ El JPEG recomprimido **pierde los metadatos EXIF** (fecha de captura, cámara, GPS). La fecha de modificación del archivo sí se conserva. Si necesitas esos datos, no actives la compresión.
+
+**¿Ya descargaste imágenes sin comprimir?** La opción **5) Comprimir imágenes ya descargadas** del menú las comprime directamente en el destino, sin volver a conectarse a SharePoint.
+
+**Obtener FFmpeg:** descarga *ffmpeg-release-essentials.zip* de [gyan.dev](https://www.gyan.dev/ffmpeg/builds/), saca `bin\ffmpeg.exe` y ponlo en cualquiera de estos lugares (se busca en este orden):
+
+1. La ruta indicada en `ffmpeg_ruta` de `config.json`.
+2. Junto a `SP-Migrar.exe` / `sp_migrar.py`.
+3. `ffmpeg\ffmpeg.exe` o `ffmpeg\bin\ffmpeg.exe` dentro de esa carpeta.
+4. Cualquier carpeta del `PATH`.
+
 ## ⚙️ Configuración
 
 La primera vez se crea `config.json` (puedes partir de [`config.example.json`](config.example.json)). Ese archivo **no se sube a git**.
@@ -213,6 +250,9 @@ La primera vez se crea `config.json` (puedes partir de [`config.example.json`](c
 | `intervalo_estado_seg` | `60` | Cada cuánto imprime la línea `[ESTADO]`. |
 | `incluir_carpeta_sitio` | `true` | Crea una carpeta con el nombre del sitio dentro del destino. |
 | `evitar_suspension` | `true` | Impide que Windows se suspenda durante la copia. |
+| `comprimir_imagenes` | `true` | Respuesta propuesta al crear una descarga. También se aplica a trabajos creados antes de esta función. |
+| `calidad_imagenes` | `65` | Calidad de JPG/WebP (1–100). Menos calidad, archivos más pequeños. |
+| `ffmpeg_ruta` | `""` | Ruta a `ffmpeg.exe` si no está junto al programa ni en el `PATH`. |
 | `tenant` · `client_id` · `client_secret` | — | Autenticación (ver abajo). |
 
 ### 🔐 Autenticación
@@ -260,7 +300,8 @@ Usa una **ruta UNC** como destino, porque las unidades mapeadas (`Z:`) no existe
 ├── requirements.txt      # Dependencias (msal, requests)
 ├── config.example.json   # Plantilla de configuración
 │
-│   Generados al usarlo (ignorados por git):
+│   Ignorados por git:
+├── ffmpeg/ffmpeg.exe     # FFmpeg para comprimir imágenes (100 MB, se descarga aparte)
 ├── config.json           # Tu configuración
 ├── token_cache.bin       # 🔒 Tu sesión de Microsoft. NO compartir.
 ├── trabajos/             # Definición (.json) y estado (.db) de cada descarga

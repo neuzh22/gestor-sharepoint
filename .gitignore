@@ -33,3 +33,5 @@ dist/
 ffmpeg/
 ffmpeg.exe
 *.spcomp.*
+
+dist_nuevo/

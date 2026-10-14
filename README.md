@@ -221,6 +221,33 @@ Lo que ya está copiado y no cambió se **omite**. Solo baja lo nuevo, lo modifi
 
 **Códigos de salida:** `0` todo OK · `2` quedaron errores · `130` detenido por el usuario.
 
+## 🚀 Velocidad y limitaciones de SharePoint
+
+SharePoint limita cuántas peticiones aceptas por minuto. Si te pasas, responde *429* y obliga a esperar. **Poner muchos hilos fijos lo empeora**: en las pruebas, 16 hilos fijos contra un SharePoint que aguantaba 6 fue **16 veces más lento** que 4 hilos, por las pausas en cadena.
+
+Por eso el programa ajusta los hilos solo:
+
+| Situación | Qué hace |
+|---|---|
+| SharePoint responde bien | Sube 1 hilo cada 15 s, hasta `hilos_max` (16). |
+| SharePoint avisa que te acercas al límite (cabecera `RateLimit-Remaining`) | Baja 1 hilo **antes** de que llegue la pausa. |
+| Llega un 429 / 503 | Baja a la mitad, respeta el `Retry-After` y espera 60 s de calma antes de volver a subir. |
+
+```text
+15:02:11 INFO    [HILOS] SharePoint responde bien: subo a 9 descargas simultáneas.
+15:02:26 INFO    [HILOS] SharePoint responde bien: subo a 10 descargas simultáneas.
+15:02:31 INFO    [ESTADO] OK 1840 | ... | hilos 10/10 | 9.71 GB a 42.30 MB/s
+```
+
+**Otras optimizaciones:**
+- **Menos peticiones:** el enlace de descarga viene en el mismo listado de la carpeta, así que no hay una petición extra por archivo. Con muchos archivos pequeños es la mitad de peticiones.
+- **Tráfico identificado:** se envía un `User-Agent`, como recomienda Microsoft, para que el tráfico tenga prioridad al aplicar límites.
+- **Escritura al NAS** con un búfer de 8 MB, para hacer menos viajes por la red.
+
+En la prueba con un SharePoint que aguantaba 12 descargas simultáneas, 4 hilos fijos tardaron 31 s y el modo automático **13 s (2,3 veces más rápido) sin ninguna pausa**.
+
+> 💡 Si prefieres hilos fijos, pon `"hilos_auto": false` y el número en `hilos`. Para probar un máximo distinto sin tocar la configuración: `SP-Migrar.exe --trabajo NOMBRE --hilos-max 24`.
+
 ## 🖼️ Compresión de imágenes
 
 Al crear una descarga, el programa pregunta **"¿Comprimir las imágenes?"**. Si respondes que sí, cada imagen se recomprime con FFmpeg justo después de descargarla:
@@ -261,7 +288,10 @@ La primera vez se crea `config.json` (puedes partir de [`config.example.json`](c
 
 | Clave | Por defecto | Descripción |
 |---|:---:|---|
-| `hilos` | `4` | Descargas simultáneas. Súbelo a 6–8 si tu enlace es rápido y bájalo si aparecen muchos 429. |
+| `hilos` | `6` | Descargas simultáneas **al empezar**. Con `hilos_auto` se ajusta solo. |
+| `hilos_auto` | `true` | Ajusta los hilos solo: sube mientras SharePoint responde bien y baja ante limitaciones (ver [Velocidad](#-velocidad-y-limitaciones-de-sharepoint)). |
+| `hilos_min` · `hilos_max` | `2` · `16` | Rango del ajuste automático. |
+| `user_agent` | `NONISV\|SP-Migrar\|SP-Migrar/1.2` | Identificación del tráfico que recomienda Microsoft. |
 | `reintentos_archivo` | `5` | Intentos por archivo dentro de una pasada. |
 | `reintentos_peticion` | `8` | Reintentos por petición ante errores 5xx o de red. |
 | `pasadas_reintento` | `3` | Pasadas finales solo con los fallidos. |

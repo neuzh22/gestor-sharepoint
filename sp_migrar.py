@@ -57,12 +57,17 @@ CLIENT_ID_DEFECTO = "14d82eec-204b-4c2f-b7e8-296a70dab67e"
 SCOPES = ["Sites.Read.All", "Files.Read.All"]
 CAMPOS = "id,name,size,file,folder,package,fileSystemInfo,lastModifiedDateTime,parentReference"
 BLOQUE = 1024 * 1024
+BUFER_DISCO = 8 * 1024 * 1024  # escrituras grandes = menos viajes por la red hasta el NAS
 
 CFG_DEFECTO = {
     "tenant": "organizations",
     "client_id": CLIENT_ID_DEFECTO,
     "client_secret": "",
-    "hilos": 4,
+    "hilos": 6,
+    "hilos_auto": True,
+    "hilos_min": 2,
+    "hilos_max": 16,
+    "user_agent": "NONISV|SP-Migrar|SP-Migrar/1.2",
     "reintentos_peticion": 8,
     "reintentos_archivo": 5,
     "pasadas_reintento": 3,
@@ -342,8 +347,12 @@ class Graph:
         self.cfg = cfg
         self.stop = stop
         self.s = requests.Session()
-        adaptador = requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=max(16, cfg["hilos"] * 4))
+        # Microsoft prioriza el tráfico "decorado" con User-Agent al aplicar limitaciones.
+        self.s.headers["User-Agent"] = cfg.get("user_agent") or CFG_DEFECTO["user_agent"]
+        conexiones = max(16, int(cfg.get("hilos_max", 16)) * 2, int(cfg["hilos"]) * 2)
+        adaptador = requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=conexiones)
         self.s.mount("https://", adaptador)
+        self.control = None  # ControlHilos del migrador en curso (si lo hay)
         self.pausa_hasta = 0.0
         self.pausa_lock = threading.Lock()
         self.red_lock = threading.Lock()
@@ -365,6 +374,8 @@ class Graph:
         except ValueError:
             seg = 30
         seg = max(5, min(seg, 900))
+        if self.control:
+            self.control.limitado()
         with self.pausa_lock:
             nuevo = time.time() + seg
             if nuevo > self.pausa_hasta:
@@ -430,6 +441,9 @@ class Graph:
 
             sc = r.status_code
             if sc < 400:
+                # SharePoint envía RateLimit-* cuando ya se consumió ~80% de la cuota: se frena antes del 429.
+                if self.control and "RateLimit-Remaining" in r.headers:
+                    self.control.precaucion()
                 return r
             msg = self._mensaje(r)
             r.close()
@@ -465,8 +479,12 @@ class Graph:
     def get_json(self, url):
         return self.request("GET", url).json()
 
-    def listar(self, drive_id, item_id):
-        url = f"{GRAPH}/drives/{drive_id}/items/{item_id}/children?$top=999&$select={CAMPOS}"
+    def listar(self, drive_id, item_id, con_url=False):
+        """con_url=True: sin $select, para que cada archivo traiga su @microsoft.graph.downloadUrl y la descarga
+        no necesite otra petición a Graph (la mitad de peticiones = menos limitaciones)."""
+        url = f"{GRAPH}/drives/{drive_id}/items/{item_id}/children?$top=999"
+        if not con_url:
+            url += f"&$select={CAMPOS}"
         while url:
             datos = self.get_json(url)
             yield from datos.get("value", [])
@@ -691,6 +709,78 @@ class Compresor:
                 os.remove(lp(temporal))
 
 
+# --------------------------------------------------------------------------- hilos adaptativos
+class ControlHilos:
+    """Cuántas descargas corren a la vez, ajustado solo (AIMD, como el control de congestión de TCP).
+
+    - Cada 15 s sin limitaciones (y con descargas terminando) sube 1 hilo, hasta el máximo.
+    - Ante un 429/503 baja a la mitad: así no vuelve a chocar enseguida con el límite y se evitan pausas repetidas.
+    - Si SharePoint avisa que se acerca al límite (cabecera RateLimit-*), baja 1 antes de que llegue la pausa.
+    """
+
+    SUBIR_CADA = 15        # segundos entre subidas de 1 hilo
+    CALMA = 60             # segundos sin limitaciones antes de volver a subir
+    AGRUPAR_429 = 10       # 429 recibidos dentro de esta ventana cuentan como uno
+    ESPACIO_PRECAUCION = 20
+
+    def __init__(self, inicial, minimo, maximo, auto=True):
+        self.minimo = max(1, int(minimo))
+        self.maximo = max(self.minimo, int(maximo))
+        self.auto = auto
+        self.limite = max(self.minimo, min(self.maximo, int(inicial)))
+        if not auto:
+            self.maximo = self.limite
+        self.activos = 0
+        self.cond = threading.Condition()
+        self.ultimo_cambio = time.time()
+        self.ultima_limitacion = 0.0
+        self.terminadas = 0
+
+    def adquirir(self, stop):
+        with self.cond:
+            while self.activos >= self.limite:
+                if stop.is_set():
+                    raise Detenido()
+                self.cond.wait(1)
+            self.activos += 1
+
+    def liberar(self):
+        with self.cond:
+            self.activos -= 1
+            self.terminadas += 1
+            ahora_ = time.time()
+            if (self.auto and self.limite < self.maximo and self.terminadas >= 1
+                    and ahora_ - self.ultimo_cambio >= self.SUBIR_CADA and ahora_ - self.ultima_limitacion >= self.CALMA):
+                self.limite += 1
+                self.ultimo_cambio = ahora_
+                self.terminadas = 0
+                log.info(f"[HILOS] SharePoint responde bien: subo a {self.limite} descargas simultáneas.")
+            self.cond.notify_all()
+
+    def limitado(self):
+        with self.cond:
+            ahora_ = time.time()
+            # Varios hilos reciben el 429 casi a la vez: se cuenta como una sola limitación.
+            if ahora_ - self.ultima_limitacion < self.AGRUPAR_429:
+                return
+            self.ultima_limitacion = ahora_
+            if self.auto and self.limite > self.minimo:
+                self.limite = max(self.minimo, self.limite // 2)
+                self.ultimo_cambio = ahora_
+                log.warning(f"[HILOS] Limitación de SharePoint: bajo a {self.limite} descargas simultáneas.")
+
+    def precaucion(self):
+        with self.cond:
+            ahora_ = time.time()
+            if not self.auto or ahora_ - self.ultimo_cambio < self.ESPACIO_PRECAUCION:
+                return
+            self.ultima_limitacion = ahora_  # no subir durante un rato
+            if self.limite > self.minimo:
+                self.limite -= 1
+                self.ultimo_cambio = ahora_
+                log.info(f"[HILOS] SharePoint avisa que se acerca al límite: bajo a {self.limite} para evitar la pausa.")
+
+
 # --------------------------------------------------------------------------- migrador
 class Migrador:
     def __init__(self, trabajo, graph, estado, cfg, stop, compresor=None):
@@ -705,9 +795,12 @@ class Migrador:
         self.raiz = trabajo["destino"]
         self.base = (os.path.join(self.raiz, limpiar(trabajo["sitio_nombre"]))
                      if cfg["incluir_carpeta_sitio"] else self.raiz)
-        hilos = max(1, int(cfg["hilos"]))
-        self.pool = ThreadPoolExecutor(hilos, thread_name_prefix="desc")
-        self.cupo = threading.BoundedSemaphore(hilos * 4)
+        self.control = ControlHilos(cfg["hilos"], cfg.get("hilos_min", 2), cfg.get("hilos_max", 16),
+                                    cfg.get("hilos_auto", True))
+        graph.control = self.control
+        # El pool tiene tantos hilos como el máximo; ControlHilos decide cuántos descargan a la vez.
+        self.pool = ThreadPoolExecutor(self.control.maximo, thread_name_prefix="desc")
+        self.cupo = threading.BoundedSemaphore(self.control.maximo * 3)
         self.futuros = set()
         self.futuros_lock = threading.Lock()
         self.en_curso = set()
@@ -825,7 +918,7 @@ class Migrador:
             if dentro:
                 self.crear_dir(self.ruta_local(drive_nombre, r))
             try:
-                for it in self.g.listar(drive_id, iid):
+                for it in self.g.listar(drive_id, iid, con_url=dentro):
                     sub = f"{r}/{it['name']}" if r else it["name"]
                     if "folder" in it or "package" in it:
                         pila.append((it["id"], sub))
@@ -927,7 +1020,12 @@ class Migrador:
                 if not self.crear_dir(os.path.dirname(local)):
                     raise ErrorPermanente("No se pudo crear la carpeta de destino")
                 t0 = time.time()
-                final = self.bajar(drive_id, it["id"], local, tam)
+                self.control.adquirir(self.stop)
+                try:
+                    final = self.bajar(drive_id, it["id"], local, tam,
+                                       it.pop("@microsoft.graph.downloadUrl", None))
+                finally:
+                    self.control.liberar()
                 bajado = final
                 comprimida, nota = 0, ""
                 if self.compresor and self.compresor.soporta(local):
@@ -988,10 +1086,11 @@ class Migrador:
             return despues, 1, f"  · comprimida {fmt_bytes(antes)} -> {fmt_bytes(despues)} (-{100 - despues * 100 // antes}%)"
         return antes, 1, "  · ya estaba optimizada"
 
-    def bajar(self, drive_id, item_id, destino, esperado):
-        """Descarga a un .sppart reanudable y lo renombra al terminar. Devuelve el tamaño final."""
+    def bajar(self, drive_id, item_id, destino, esperado, url_listado=None):
+        """Descarga a un .sppart reanudable y lo renombra al terminar. Devuelve el tamaño final.
+        url_listado: enlace de descarga que ya vino en el listado (ahorra una petición a Graph)."""
         parcial = destino + ".sppart"
-        url = None
+        url = url_listado
         intentos = 0
         maximo = self.cfg["reintentos_peticion"]
 
@@ -1014,6 +1113,9 @@ class Migrador:
             try:
                 r = self.g.request("GET", url, headers=cab, stream=True, preauth=True)
             except UrlCaducada:
+                if url is url_listado:
+                    url_listado = url = None  # el enlace del listado venció (dura ~1 h): se pide uno nuevo sin contar intento
+                    continue
                 url = None
                 fallo("Acceso denegado o URL de descarga caducada repetidamente")
                 continue
@@ -1027,7 +1129,7 @@ class Migrador:
             largo = int(largo) if largo and largo.isdigit() else None
             recibidos = 0
             try:
-                with open(lp(parcial), modo) as f:
+                with open(lp(parcial), modo, buffering=BUFER_DISCO) as f:
                     for trozo in r.iter_content(BLOQUE):
                         if self.stop.is_set():
                             raise Detenido()
@@ -1059,7 +1161,8 @@ class Migrador:
             cola = len(self.futuros)
         imgs = f" | imágenes comprimidas {s.comprimidas} (ahorro {fmt_bytes(s.ahorro)})" if self.compresor else ""
         return (f"OK {s.ok} | omitidos {s.omitidos} | errores {s.errores} | descubiertos {s.descubiertos} | "
-                f"en cola {cola} | {fmt_bytes(s.bytes)} a {fmt_bytes(vel)}/s | {fmt_duracion(trans)}{imgs}")
+                f"en cola {cola} | hilos {self.control.activos}/{self.control.limite} | "
+                f"{fmt_bytes(s.bytes)} a {fmt_bytes(vel)}/s | {fmt_duracion(trans)}{imgs}")
 
     def _monitor(self):
         ultimo_titulo = 0
@@ -1494,7 +1597,11 @@ def ejecutar_trabajo(trabajo, cfg, solo_fallidos=False):
                 break
             except ERRORES_RED as e:
                 g.esperar_red(e) or g.dormir(30)
-        log.info(f"Conectado como {auth.usuario()}. Hilos de descarga: {cfg['hilos']}")
+        if cfg.get("hilos_auto", True):
+            log.info(f"Conectado como {auth.usuario()}. Hilos automáticos: empieza con {cfg['hilos']} "
+                     f"y se ajusta solo entre {cfg.get('hilos_min', 2)} y {cfg.get('hilos_max', 16)}.")
+        else:
+            log.info(f"Conectado como {auth.usuario()}. Hilos de descarga fijos: {cfg['hilos']}")
         compresor = crear_compresor(trabajo, cfg)
         os.makedirs(DIR_TRABAJOS, exist_ok=True)
         db = Estado(os.path.join(DIR_TRABAJOS, f"{trabajo['nombre']}.db"))
@@ -1651,11 +1758,14 @@ def main():
     p = argparse.ArgumentParser(description="Copia carpetas de SharePoint Online a disco local / NAS.")
     p.add_argument("--trabajo", help="nombre del trabajo guardado (o ruta a su .json) para ejecutarlo sin menú")
     p.add_argument("--solo-fallidos", action="store_true", help="solo reintentar lo que falló")
-    p.add_argument("--hilos", type=int, help="descargas simultáneas (por defecto el de config.json)")
+    p.add_argument("--hilos", type=int, help="descargas simultáneas al empezar (por defecto el de config.json)")
+    p.add_argument("--hilos-max", type=int, help="máximo de descargas simultáneas en modo automático")
     a = p.parse_args()
     cfg = cargar_config()
     if a.hilos:
         cfg["hilos"] = a.hilos
+    if a.hilos_max:
+        cfg["hilos_max"] = a.hilos_max
     configurar_log()
     if a.trabajo:
         sys.exit(ejecutar_trabajo(cargar_trabajo(a.trabajo), cfg, a.solo_fallidos))

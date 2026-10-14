@@ -6,6 +6,7 @@
   "hilos_auto": true,
   "hilos_min": 2,
   "hilos_max": 16,
+  "hilos_listado": 6,
   "user_agent": "NONISV|SP-Migrar|SP-Migrar/1.2",
   "reintentos_peticion": 8,
   "reintentos_archivo": 5,

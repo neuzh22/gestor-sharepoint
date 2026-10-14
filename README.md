@@ -157,37 +157,47 @@ Si tus carpetas tienen muchos niveles y solo quieres las de un nombre concreto, 
 ```text
   Nombre de carpeta (Enter = descargar TODO): 2026
 
-  Búsqueda terminada: 214 carpetas revisadas.
-  Se encontraron 87 carpeta(s), 35.20 GB en total:
-    - Documentos/Clientes/ACME/Camión/2026       (1.20 GB)
-    - Documentos/Clientes/ACME/Contenedor/2026   (840.00 MB)
-    - Documentos/Clientes/BETA/2026              (2.10 GB)
-    ...
-  ¿Descargar solo estas carpetas? (S/n):
+    1) Empezar a descargar YA: va buscando las carpetas '2026' y descargando a la vez (recomendado)
+    2) Primero buscarlas y mostrarme la lista con tamaños (con miles de carpetas puede tardar)
 ```
 
-- Se descarga cada carpeta `2026` **completa**, con sus subcarpetas, y se respeta su ruta (`Clientes\ACME\Camión\2026\...`).
-- No se crean carpetas vacías de clientes que no tengan 2026, ni se bajan archivos sueltos de otros niveles.
+- **Opción 1:** no espera a revisar todo. Empieza a descargar en cuanto encuentra la primera carpeta `2026` y sigue buscando el resto mientras tanto.
+- **Opción 2:** primero te muestra cuántas hay y cuánto pesan. Puedes pulsar `Ctrl+C` para dejar de buscar.
+- Revisa **6 carpetas a la vez** (`hilos_listado`). En las pruebas, recorrer 300 carpetas pasó de 40 s a 7 s.
+- Se descarga cada carpeta `2026` **completa**, con sus subcarpetas. No se crean carpetas vacías de clientes que no tengan 2026, ni se bajan archivos sueltos de otros niveles.
 - El nombre debe ser **exacto**, sin distinguir mayúsculas: `Notas 2026` no cuenta. Puedes poner varios (`2025, 2026`) o usar comodines (`2026*`).
 
-### 6. Elegir el destino y confirmar
+### 6. Elegir cómo quedan las carpetas en el destino
 
 ```text
-  Ruta destino: \\192.168.1.50\Respaldos\SharePoint
+ ¿CÓMO QUIERES LAS CARPETAS EN EL DESTINO?
+    1) Desde la carpeta elegida (recomendado):
+         Destino\BANANO\...\2026\...
+    2) Con la ruta completa de SharePoint:
+         Destino\Gestion\Documentos\Certificados\DIGITADORES\CERTIFICADOS\BANANO\...\2026\...
+```
+
+Con la **opción 1**, cada carpeta que elegiste va directo al destino con su nombre, y a partir de ahí se respeta todo lo que hay dentro:
+
+```text
+\NAS\Respaldos\
+├── BANANO\
+│   ├── CLIENTE_01\Camion\2026\...
+│   └── CLIENTE_01\Contenedor\2026\...
+└── BASC\
+    └── CLIENTE_01\Camion\2026\...
+```
+
+Si dos carpetas elegidas se llaman igual, la segunda se guarda como `Nombre (2)`.
+
+### 7. Elegir el destino y confirmar
+
+```text
+  Ruta destino: \192.168.1.50\Respaldos\SharePoint
   Espacio libre en destino: 3.20 TB  |  Tamaño a copiar: 22.37 GB
 ```
 
-Lo descargado queda así:
-
-```text
-\\192.168.1.50\Respaldos\SharePoint\
-└── Ventas\                ← sitio
-    └── Documentos\        ← biblioteca
-        ├── Clientes\
-        └── Proyectos\
-```
-
-### 7. Si se interrumpe
+### 8. Si se interrumpe
 
 Usa la opción **2** del menú, o ejecútalo directamente:
 
@@ -291,6 +301,7 @@ La primera vez se crea `config.json` (puedes partir de [`config.example.json`](c
 | `hilos` | `6` | Descargas simultáneas **al empezar**. Con `hilos_auto` se ajusta solo. |
 | `hilos_auto` | `true` | Ajusta los hilos solo: sube mientras SharePoint responde bien y baja ante limitaciones (ver [Velocidad](#-velocidad-y-limitaciones-de-sharepoint)). |
 | `hilos_min` · `hilos_max` | `2` · `16` | Rango del ajuste automático. |
+| `hilos_listado` | `6` | Carpetas que se revisan a la vez al buscar (por ejemplo, las `2026`). |
 | `user_agent` | `NONISV\|SP-Migrar\|SP-Migrar/1.2` | Identificación del tráfico que recomienda Microsoft. |
 | `reintentos_archivo` | `5` | Intentos por archivo dentro de una pasada. |
 | `reintentos_peticion` | `8` | Reintentos por petición ante errores 5xx o de red. |

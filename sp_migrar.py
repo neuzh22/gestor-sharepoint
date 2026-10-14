@@ -33,7 +33,7 @@ import sys
 import threading
 import time
 import urllib.parse
-from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 try:
     import msal
@@ -67,6 +67,7 @@ CFG_DEFECTO = {
     "hilos_auto": True,
     "hilos_min": 2,
     "hilos_max": 16,
+    "hilos_listado": 6,
     "user_agent": "NONISV|SP-Migrar|SP-Migrar/1.2",
     "reintentos_peticion": 8,
     "reintentos_archivo": 5,
@@ -185,6 +186,60 @@ def coincide_filtro(ruta, filtro):
         return True
     return any(fnmatch.fnmatchcase(seg.strip().lower(), patron.lower())
                for seg in ruta.split("/") if seg for patron in filtro)
+
+
+def recorrer_paralelo(g, drive_id, item_id, ruta, hilos, entrar, con_url, stop=None):
+    """Lista un árbol de carpetas haciendo varias peticiones a la vez (mucho más rápido con miles de carpetas).
+
+    Rinde (item_id, ruta, hijos, error) por cada carpeta listada, en el orden en que van terminando.
+    entrar(ruta_subcarpeta) -> bool decide si se baja a esa subcarpeta.
+    con_url(ruta) -> bool pide el listado completo (con enlaces de descarga) para esa carpeta.
+    """
+    pool = ThreadPoolExecutor(max(1, int(hilos)), thread_name_prefix="lista")
+    pendientes = {}
+
+    def listar(iid, completo):
+        return list(g.listar(drive_id, iid, con_url=completo))
+
+    def enviar(iid, r):
+        pendientes[pool.submit(listar, iid, con_url(r))] = (iid, r)
+
+    try:
+        enviar(item_id, ruta)
+        while pendientes:
+            if stop is not None and stop.is_set():
+                raise Detenido()
+            hechos, _ = wait(list(pendientes), timeout=1, return_when=FIRST_COMPLETED)
+            for f in hechos:
+                iid, r = pendientes.pop(f)
+                try:
+                    hijos, error = f.result(), None
+                except Detenido:
+                    raise
+                except Exception as e:
+                    hijos, error = [], e
+                for h in hijos:
+                    if "folder" in h or "package" in h:
+                        sub = f"{r}/{h['name']}" if r else h["name"]
+                        if entrar(sub):
+                            enviar(h["id"], sub)
+                yield iid, r, hijos, error
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
+def nombres_locales(selecciones):
+    """Nombre de la carpeta raíz en el destino para cada selección (modo 'desde la carpeta elegida').
+    Si dos selecciones se llaman igual, se distinguen con (2), (3)..."""
+    usados, res = set(), []
+    for s in selecciones:
+        base = limpiar(s["ruta"].split("/")[-1] if s["ruta"] else s["drive_nombre"])
+        nombre, k = base, 2
+        while nombre.lower() in usados:
+            nombre, k = f"{base} ({k})", k + 1
+        usados.add(nombre.lower())
+        res.append(nombre)
+    return res
 
 
 def es_disco_lleno(e):
@@ -795,6 +850,12 @@ class Migrador:
         self.raiz = trabajo["destino"]
         self.base = (os.path.join(self.raiz, limpiar(trabajo["sitio_nombre"]))
                      if cfg["incluir_carpeta_sitio"] else self.raiz)
+        # estructura "seleccion": cada carpeta elegida va directo al destino (los trabajos antiguos usan "completa").
+        self.raices = []
+        if trabajo.get("estructura") == "seleccion":
+            sels = trabajo["selecciones"]
+            self.raices = sorted(((s["drive_nombre"], s["ruta"], n) for s, n in zip(sels, nombres_locales(sels))),
+                                 key=lambda x: len(x[1]), reverse=True)
         self.control = ControlHilos(cfg["hilos"], cfg.get("hilos_min", 2), cfg.get("hilos_max", 16),
                                     cfg.get("hilos_auto", True))
         graph.control = self.control
@@ -809,6 +870,13 @@ class Migrador:
 
     # ---------- rutas y disco
     def ruta_local(self, drive_nombre, ruta_remota):
+        if self.raices:
+            # Modo "desde la carpeta elegida": Destino\<carpeta elegida>\<resto de la ruta>
+            for dn, sel_ruta, nombre in self.raices:
+                if dn == drive_nombre and (not sel_ruta or ruta_remota == sel_ruta
+                                           or ruta_remota.startswith(sel_ruta + "/")):
+                    resto = ruta_remota[len(sel_ruta):]
+                    return os.path.join(self.raiz, nombre, *[limpiar(p) for p in resto.split("/") if p])
         partes = [limpiar(p) for p in ruta_remota.split("/") if p]
         return os.path.join(self.base, limpiar(drive_nombre), *partes)
 
@@ -907,32 +975,28 @@ class Migrador:
         return detenido
 
     def recorrer(self, drive_id, drive_nombre, item_id, ruta):
-        """Recorre en profundidad. Con filtro de carpetas, solo descarga lo que esté dentro de una carpeta que
-        coincida (p. ej. '2026'); el resto se recorre únicamente para encontrarlas, sin crear carpetas vacías."""
-        pila = [(item_id, ruta)]
-        while pila:
-            if self.stop.is_set():
-                raise Detenido()
-            iid, r = pila.pop()
-            dentro = coincide_filtro(r, self.filtro)
-            if dentro:
-                self.crear_dir(self.ruta_local(drive_nombre, r))
-            try:
-                for it in self.g.listar(drive_id, iid, con_url=dentro):
-                    sub = f"{r}/{it['name']}" if r else it["name"]
-                    if "folder" in it or "package" in it:
-                        pila.append((it["id"], sub))
-                    elif "file" in it and dentro:
-                        self.encolar(drive_id, drive_nombre, it, sub)
-                self.db.carpeta_ok(drive_id, iid)
-            except Detenido:
-                raise
-            except NoEncontrado:
+        """Lista varias carpetas a la vez y va encolando descargas mientras sigue buscando.
+        Con filtro de carpetas, solo descarga lo que esté dentro de una carpeta que coincida (p. ej. '2026');
+        el resto se recorre únicamente para encontrarlas, sin crear carpetas vacías."""
+        en_filtro = lambda r: coincide_filtro(r, self.filtro)  # noqa: E731
+        for iid, r, hijos, error in recorrer_paralelo(self.g, drive_id, item_id, ruta,
+                                                      self.cfg.get("hilos_listado", 6),
+                                                      entrar=lambda sub: True, con_url=en_filtro, stop=self.stop):
+            if isinstance(error, NoEncontrado):
                 log.warning(f"La carpeta '{r}' ya no existe en SharePoint.")
                 self.db.carpeta_ok(drive_id, iid)
-            except Exception as e:
-                log.error(f"No se pudo listar la carpeta '{r}': {e}")
-                self.db.carpeta_error(drive_id, iid, drive_nombre, r, str(e))
+                continue
+            if error is not None:
+                log.error(f"No se pudo listar la carpeta '{r}': {error}")
+                self.db.carpeta_error(drive_id, iid, drive_nombre, r, str(error))
+                continue
+            dentro = en_filtro(r)
+            if dentro:
+                self.crear_dir(self.ruta_local(drive_nombre, r))
+                for it in hijos:
+                    if "file" in it:
+                        self.encolar(drive_id, drive_nombre, it, f"{r}/{it['name']}" if r else it["name"])
+            self.db.carpeta_ok(drive_id, iid)
 
     def reintentar(self, fila):
         try:
@@ -1381,57 +1445,60 @@ def pedir_destino(total):
 
 
 # --------------------------------------------------------------------------- trabajos
-def buscar_carpetas_filtro(g, sel, filtro):
-    """Recorre lo seleccionado y devuelve las carpetas que coinciden con el filtro [(selección, ruta, tamaño)].
-    No entra dentro de las que coinciden (su tamaño ya incluye todo su contenido)."""
+def buscar_carpetas_filtro(g, sel, filtro, hilos=8):
+    """Recorre lo seleccionado (varias carpetas a la vez) y devuelve las que coinciden con el filtro
+    [(selección, ruta, tamaño)]. No entra dentro de las que coinciden (su tamaño ya incluye su contenido).
+    Ctrl+C detiene la búsqueda y devuelve lo encontrado hasta ese momento."""
     encontradas = []
     revisadas = 0
-    for s in sel:
-        if coincide_filtro(s["ruta"], filtro):
-            encontradas.append((s, s["ruta"], s.get("tamano") or 0))
-            continue
-        pila = [(s["item_id"], s["ruta"])]
-        while pila:
-            iid, ruta = pila.pop()
-            revisadas += 1
-            if revisadas % 25 == 0:
-                print(f"\r  Buscando... {revisadas} carpetas revisadas, {len(encontradas)} encontradas", end="", flush=True)
-            try:
-                hijos = list(g.listar(s["drive_id"], iid))
-            except (ErrorPermanente, AgotadoReintentos) as e:
-                print(f"\n  No se pudo revisar '{ruta}': {e}")
+    try:
+        for s in sel:
+            if coincide_filtro(s["ruta"], filtro):
+                encontradas.append((s, s["ruta"], s.get("tamano") or 0))
                 continue
-            for h in hijos:
-                if "folder" not in h and "package" not in h:
-                    continue
-                sub = f"{ruta}/{h['name']}" if ruta else h["name"]
-                if coincide_filtro(h["name"], filtro):
-                    encontradas.append((s, sub, h.get("size") or 0))
-                else:
-                    pila.append((h["id"], sub))
-    print(f"\r  Búsqueda terminada: {revisadas} carpetas revisadas.                         ")
+            no_entrar = lambda sub: not coincide_filtro(sub.rsplit("/", 1)[-1], filtro)  # noqa: E731
+            for _, ruta, hijos, error in recorrer_paralelo(g, s["drive_id"], s["item_id"], s["ruta"], hilos,
+                                                           entrar=no_entrar, con_url=lambda r: False):
+                revisadas += 1
+                if error is not None:
+                    print(f"\n  No se pudo revisar '{ruta}': {error}")
+                for h in hijos:
+                    if ("folder" in h or "package" in h) and coincide_filtro(h["name"], filtro):
+                        encontradas.append((s, f"{ruta}/{h['name']}" if ruta else h["name"], h.get("size") or 0))
+                if revisadas % 25 == 0:
+                    print(f"\r  Buscando... {revisadas} carpetas revisadas, {len(encontradas)} encontradas  "
+                          f"(Ctrl+C para dejar de buscar)", end="", flush=True)
+        print(f"\r  Búsqueda terminada: {revisadas} carpetas revisadas.{' ' * 40}")
+    except KeyboardInterrupt:
+        print(f"\n  Búsqueda detenida: {revisadas} carpetas revisadas (la lista puede estar incompleta).")
     return sorted(encontradas, key=lambda e: (e[0]["drive_nombre"], e[1].lower()))
 
 
 def pedir_filtro(g, sel):
-    """Pregunta si solo se quieren ciertas subcarpetas (p. ej. '2026'). Devuelve (filtro, tamaño, n_encontradas)."""
+    """Pregunta si solo se quieren ciertas subcarpetas (p. ej. '2026').
+    Devuelve (filtro, tamaño | None, n_encontradas | None); None = no se buscó antes (se busca mientras descarga)."""
     print("\n" + "=" * 78)
     print(" ¿DESCARGAR TODO O SOLO CIERTAS SUBCARPETAS?")
     print("=" * 78)
     print("  Si dentro de lo elegido solo quieres las carpetas con un nombre concreto, escríbelo.")
-    print("  Se buscan en TODOS los niveles y se descarga cada una completa, respetando su ruta.")
-    print("  Ejemplo: eliges 'Clientes' y escribes 2026  ->  baja  Clientes/ACME/Camión/2026/...")
-    print("                                                         Clientes/ACME/Contenedor/2026/...")
+    print("  Se buscan en TODOS los niveles y se descarga cada una completa.")
+    print("  Ejemplo: eliges 'Clientes' y escribes 2026  ->  baja  ACME/Camión/2026/...")
+    print("                                                         ACME/Contenedor/2026/...")
     print("  Varias separadas por coma (2025, 2026). Admite * (ej: 2026*).")
     while True:
         texto = input("\n  Nombre de carpeta (Enter = descargar TODO): ").strip()
         if not texto:
             return [], 0, 0
         filtro = [p.strip() for p in texto.split(",") if p.strip()]
-        print(f"\n  Buscando carpetas {', '.join(repr(f) for f in filtro)}...")
+        nombres = ", ".join(repr(f) for f in filtro)
+        print(f"\n    1) Empezar a descargar YA: va buscando las carpetas {nombres} y descargando a la vez (recomendado)")
+        print("    2) Primero buscarlas y mostrarme la lista con tamaños (con miles de carpetas puede tardar)")
+        if (input("\n  Opción [1]: ").strip() or "1") != "2":
+            return filtro, None, None
+        print(f"\n  Buscando carpetas {nombres}...")
         encontradas = buscar_carpetas_filtro(g, sel, filtro)
         if not encontradas:
-            print(f"  No se encontró ninguna carpeta llamada {', '.join(repr(f) for f in filtro)}. Revisa el nombre.")
+            print(f"  No se encontró ninguna carpeta llamada {nombres}. Revisa el nombre.")
             continue
         total = sum(e[2] for e in encontradas)
         print(f"\n  Se encontraron {len(encontradas)} carpeta(s), {fmt_bytes(total)} en total:")
@@ -1441,6 +1508,22 @@ def pedir_filtro(g, sel):
             print(f"    ... y {len(encontradas) - 15} más")
         if si_no("\n  ¿Descargar solo estas carpetas?"):
             return filtro, total, len(encontradas)
+
+
+def pedir_estructura(sel, sitio, filtro):
+    """Cómo se guarda en el destino. Devuelve 'seleccion' (desde la carpeta elegida) o 'completa'."""
+    s = sel[0]
+    nombre = nombres_locales(sel)[0]
+    medio = f"...\\{filtro[0]}\\..." if filtro else "..."
+    completa = "\\".join(limpiar(p) for p in [sitio["displayName"], s["drive_nombre"], *s["ruta"].split("/")] if p)
+    print("\n" + "=" * 78)
+    print(" ¿CÓMO QUIERES LAS CARPETAS EN EL DESTINO?")
+    print("=" * 78)
+    print(f"    1) Desde la carpeta elegida (recomendado):")
+    print(f"         Destino\\{nombre}\\{medio}")
+    print(f"    2) Con la ruta completa de SharePoint:")
+    print(f"         Destino\\{completa}\\{medio}")
+    return "completa" if (input("\n  Opción [1]: ").strip() or "1") == "2" else "seleccion"
 
 
 def ruta_trabajo(nombre):
@@ -1509,8 +1592,9 @@ def nuevo_trabajo(cfg):
 
     filtro, total_filtrado, encontradas = pedir_filtro(g, sel)
     if filtro:
-        total = total_filtrado
+        total = total_filtrado  # None si se busca mientras descarga (tamaño desconocido)
 
+    estructura = pedir_estructura(sel, sitio, filtro)
     destino = pedir_destino(total)
 
     comprimir = False
@@ -1536,21 +1620,28 @@ def nuevo_trabajo(cfg):
         "tamano_estimado": total,
         "comprimir_imagenes": comprimir,
         "filtro_carpetas": filtro,
+        "estructura": estructura,
         "creado": ahora(),
     }
     os.makedirs(DIR_TRABAJOS, exist_ok=True)
     with open(ruta_trabajo(nombre), "w", encoding="utf-8") as f:
         json.dump(trabajo, f, indent=2, ensure_ascii=False)
-    carpeta_final = os.path.join(destino, limpiar(sitio["displayName"])) if cfg["incluir_carpeta_sitio"] else destino
     print("\n" + "=" * 78)
     print(" RESUMEN")
     print("=" * 78)
-    for s in sel:
-        print(f"   Carpeta:  {_ruta_legible(s)}")
+    if estructura == "seleccion":
+        for s, n in zip(sel, nombres_locales(sel)):
+            print(f"   Carpeta:  {_ruta_legible(s)}")
+            print(f"        ->   {os.path.join(destino, n)}")
+    else:
+        for s in sel:
+            print(f"   Carpeta:  {_ruta_legible(s)}")
+        base = os.path.join(destino, limpiar(sitio["displayName"])) if cfg["incluir_carpeta_sitio"] else destino
+        print(f"   Destino:  {base}  (ruta completa de SharePoint)")
     if filtro:
-        print(f"   Filtro:   solo carpetas {', '.join(repr(f) for f in filtro)} ({encontradas} encontradas)")
-    print(f"   Destino:  {carpeta_final}")
-    print(f"   Tamaño:   {fmt_bytes(total)}")
+        cuantas = f"{encontradas} encontradas" if encontradas is not None else "se buscan mientras descarga"
+        print(f"   Filtro:   solo carpetas {', '.join(repr(f) for f in filtro)} ({cuantas})")
+    print(f"   Tamaño:   {fmt_bytes(total) if total is not None else 'se sabrá al terminar'}")
     print(f"   Imágenes: {'se comprimen al ' + str(cfg['calidad_imagenes']) + '% con FFmpeg' if comprimir else 'sin comprimir'}")
     print(f"\n   Si se interrumpe, la continúas desde el menú, opción 2 ('{nombre}').")
     return trabajo

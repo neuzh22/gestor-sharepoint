@@ -19,6 +19,7 @@ import csv
 import ctypes
 import datetime as dt
 import errno
+import fnmatch
 import glob
 import json
 import logging
@@ -170,6 +171,15 @@ def a_timestamp(txt):
 
 def ahora():
     return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def coincide_filtro(ruta, filtro):
+    """True si algún nivel de la ruta se llama como el filtro (sin distinguir mayúsculas; admite * y ?).
+    Sin filtro, todo coincide."""
+    if not filtro:
+        return True
+    return any(fnmatch.fnmatchcase(seg.strip().lower(), patron.lower())
+               for seg in ruta.split("/") if seg for patron in filtro)
 
 
 def es_disco_lleno(e):
@@ -690,6 +700,7 @@ class Migrador:
         self.cfg = cfg
         self.stop = stop
         self.compresor = compresor
+        self.filtro = trabajo.get("filtro_carpetas") or []
         self.stats = Stats()
         self.raiz = trabajo["destino"]
         self.base = (os.path.join(self.raiz, limpiar(trabajo["sitio_nombre"]))
@@ -768,6 +779,9 @@ class Migrador:
             if not self.nas_disponible():
                 self.error_disco_transitorio(OSError("destino no disponible"))
             self.crear_dir(self.base)
+            if self.filtro:
+                log.info(f"Filtro activo: solo se descarga lo que está dentro de carpetas llamadas "
+                         f"{', '.join(repr(f) for f in self.filtro)} (en cualquier nivel).")
             if not solo_fallidos:
                 for sel in self.t["selecciones"]:
                     log.info(f"=== Recorriendo {sel['drive_nombre']}/{sel['ruta'] or '(biblioteca completa)'} ===")
@@ -800,18 +814,22 @@ class Migrador:
         return detenido
 
     def recorrer(self, drive_id, drive_nombre, item_id, ruta):
+        """Recorre en profundidad. Con filtro de carpetas, solo descarga lo que esté dentro de una carpeta que
+        coincida (p. ej. '2026'); el resto se recorre únicamente para encontrarlas, sin crear carpetas vacías."""
         pila = [(item_id, ruta)]
         while pila:
             if self.stop.is_set():
                 raise Detenido()
             iid, r = pila.pop()
-            self.crear_dir(self.ruta_local(drive_nombre, r))
+            dentro = coincide_filtro(r, self.filtro)
+            if dentro:
+                self.crear_dir(self.ruta_local(drive_nombre, r))
             try:
                 for it in self.g.listar(drive_id, iid):
                     sub = f"{r}/{it['name']}" if r else it["name"]
                     if "folder" in it or "package" in it:
                         pila.append((it["id"], sub))
-                    elif "file" in it:
+                    elif "file" in it and dentro:
                         self.encolar(drive_id, drive_nombre, it, sub)
                 self.db.carpeta_ok(drive_id, iid)
             except Detenido:
@@ -1260,6 +1278,68 @@ def pedir_destino(total):
 
 
 # --------------------------------------------------------------------------- trabajos
+def buscar_carpetas_filtro(g, sel, filtro):
+    """Recorre lo seleccionado y devuelve las carpetas que coinciden con el filtro [(selección, ruta, tamaño)].
+    No entra dentro de las que coinciden (su tamaño ya incluye todo su contenido)."""
+    encontradas = []
+    revisadas = 0
+    for s in sel:
+        if coincide_filtro(s["ruta"], filtro):
+            encontradas.append((s, s["ruta"], s.get("tamano") or 0))
+            continue
+        pila = [(s["item_id"], s["ruta"])]
+        while pila:
+            iid, ruta = pila.pop()
+            revisadas += 1
+            if revisadas % 25 == 0:
+                print(f"\r  Buscando... {revisadas} carpetas revisadas, {len(encontradas)} encontradas", end="", flush=True)
+            try:
+                hijos = list(g.listar(s["drive_id"], iid))
+            except (ErrorPermanente, AgotadoReintentos) as e:
+                print(f"\n  No se pudo revisar '{ruta}': {e}")
+                continue
+            for h in hijos:
+                if "folder" not in h and "package" not in h:
+                    continue
+                sub = f"{ruta}/{h['name']}" if ruta else h["name"]
+                if coincide_filtro(h["name"], filtro):
+                    encontradas.append((s, sub, h.get("size") or 0))
+                else:
+                    pila.append((h["id"], sub))
+    print(f"\r  Búsqueda terminada: {revisadas} carpetas revisadas.                         ")
+    return sorted(encontradas, key=lambda e: (e[0]["drive_nombre"], e[1].lower()))
+
+
+def pedir_filtro(g, sel):
+    """Pregunta si solo se quieren ciertas subcarpetas (p. ej. '2026'). Devuelve (filtro, tamaño, n_encontradas)."""
+    print("\n" + "=" * 78)
+    print(" ¿DESCARGAR TODO O SOLO CIERTAS SUBCARPETAS?")
+    print("=" * 78)
+    print("  Si dentro de lo elegido solo quieres las carpetas con un nombre concreto, escríbelo.")
+    print("  Se buscan en TODOS los niveles y se descarga cada una completa, respetando su ruta.")
+    print("  Ejemplo: eliges 'Clientes' y escribes 2026  ->  baja  Clientes/ACME/Camión/2026/...")
+    print("                                                         Clientes/ACME/Contenedor/2026/...")
+    print("  Varias separadas por coma (2025, 2026). Admite * (ej: 2026*).")
+    while True:
+        texto = input("\n  Nombre de carpeta (Enter = descargar TODO): ").strip()
+        if not texto:
+            return [], 0, 0
+        filtro = [p.strip() for p in texto.split(",") if p.strip()]
+        print(f"\n  Buscando carpetas {', '.join(repr(f) for f in filtro)}...")
+        encontradas = buscar_carpetas_filtro(g, sel, filtro)
+        if not encontradas:
+            print(f"  No se encontró ninguna carpeta llamada {', '.join(repr(f) for f in filtro)}. Revisa el nombre.")
+            continue
+        total = sum(e[2] for e in encontradas)
+        print(f"\n  Se encontraron {len(encontradas)} carpeta(s), {fmt_bytes(total)} en total:")
+        for s, ruta, tam in encontradas[:15]:
+            print(f"    - {s['drive_nombre']}/{ruta}   ({fmt_bytes(tam)})")
+        if len(encontradas) > 15:
+            print(f"    ... y {len(encontradas) - 15} más")
+        if si_no("\n  ¿Descargar solo estas carpetas?"):
+            return filtro, total, len(encontradas)
+
+
 def ruta_trabajo(nombre):
     return os.path.join(DIR_TRABAJOS, f"{nombre}.json")
 
@@ -1324,6 +1404,10 @@ def nuevo_trabajo(cfg):
         print(f"  - {s['drive_nombre']}/{s['ruta'] or '(biblioteca completa)'}   {fmt_bytes(s.get('tamano'))}")
     print(f" Total aproximado: {fmt_bytes(total)}")
 
+    filtro, total_filtrado, encontradas = pedir_filtro(g, sel)
+    if filtro:
+        total = total_filtrado
+
     destino = pedir_destino(total)
 
     comprimir = False
@@ -1348,6 +1432,7 @@ def nuevo_trabajo(cfg):
         "selecciones": [{k: s[k] for k in ("drive_id", "drive_nombre", "item_id", "ruta")} for s in sel],
         "tamano_estimado": total,
         "comprimir_imagenes": comprimir,
+        "filtro_carpetas": filtro,
         "creado": ahora(),
     }
     os.makedirs(DIR_TRABAJOS, exist_ok=True)
@@ -1359,6 +1444,8 @@ def nuevo_trabajo(cfg):
     print("=" * 78)
     for s in sel:
         print(f"   Carpeta:  {_ruta_legible(s)}")
+    if filtro:
+        print(f"   Filtro:   solo carpetas {', '.join(repr(f) for f in filtro)} ({encontradas} encontradas)")
     print(f"   Destino:  {carpeta_final}")
     print(f"   Tamaño:   {fmt_bytes(total)}")
     print(f"   Imágenes: {'se comprimen al ' + str(cfg['calidad_imagenes']) + '% con FFmpeg' if comprimir else 'sin comprimir'}")

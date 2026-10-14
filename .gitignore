@@ -35,3 +35,4 @@ ffmpeg.exe
 *.spcomp.*
 
 dist_nuevo/
+build_tmp_dist/

@@ -188,41 +188,52 @@ def coincide_filtro(ruta, filtro):
                for seg in ruta.split("/") if seg for patron in filtro)
 
 
-def recorrer_paralelo(g, drive_id, item_id, ruta, hilos, entrar, con_url, stop=None):
-    """Lista un árbol de carpetas haciendo varias peticiones a la vez (mucho más rápido con miles de carpetas).
+def recorrer_paralelo(g, drive_id, item_id, ruta, hilos, entrar, con_url, stop=None, control=None):
+    """Lista un árbol de carpetas haciendo varias peticiones a la vez.
+
+    Recorre en PROFUNDIDAD (entra hasta el fondo de una rama antes de pasar a la siguiente), así las carpetas
+    buscadas, que suelen estar al final (p. ej. Cliente/Camión/2026), aparecen pronto y la descarga empieza ya.
+    Si se pasa un ControlHilos, cuántas carpetas se listan a la vez se ajusta solo ante limitaciones (429).
 
     Rinde (item_id, ruta, hijos, error) por cada carpeta listada, en el orden en que van terminando.
     entrar(ruta_subcarpeta) -> bool decide si se baja a esa subcarpeta.
     con_url(ruta) -> bool pide el listado completo (con enlaces de descarga) para esa carpeta.
     """
     pool = ThreadPoolExecutor(max(1, int(hilos)), thread_name_prefix="lista")
-    pendientes = {}
+    pila = [(item_id, ruta)]
+    en_vuelo = {}
 
     def listar(iid, completo):
         return list(g.listar(drive_id, iid, con_url=completo))
 
-    def enviar(iid, r):
-        pendientes[pool.submit(listar, iid, con_url(r))] = (iid, r)
-
     try:
-        enviar(item_id, ruta)
-        while pendientes:
+        while pila or en_vuelo:
             if stop is not None and stop.is_set():
                 raise Detenido()
-            hechos, _ = wait(list(pendientes), timeout=1, return_when=FIRST_COMPLETED)
+            limite = min(int(hilos), control.limite) if control else int(hilos)
+            while pila and len(en_vuelo) < max(1, limite):
+                iid, r = pila.pop()
+                en_vuelo[pool.submit(listar, iid, con_url(r))] = (iid, r)
+            hechos, _ = wait(list(en_vuelo), timeout=1, return_when=FIRST_COMPLETED)
             for f in hechos:
-                iid, r = pendientes.pop(f)
+                iid, r = en_vuelo.pop(f)
                 try:
                     hijos, error = f.result(), None
+                    if control:
+                        control.exito()
                 except Detenido:
                     raise
                 except Exception as e:
                     hijos, error = [], e
+                subcarpetas = []
                 for h in hijos:
                     if "folder" in h or "package" in h:
                         sub = f"{r}/{h['name']}" if r else h["name"]
                         if entrar(sub):
-                            enviar(h["id"], sub)
+                            subcarpetas.append((h["id"], sub))
+                # Al revés, para que la pila saque primero la primera en orden alfabético.
+                subcarpetas.sort(key=lambda x: x[1].lower(), reverse=True)
+                pila.extend(subcarpetas)
                 yield iid, r, hijos, error
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
@@ -407,7 +418,7 @@ class Graph:
         conexiones = max(16, int(cfg.get("hilos_max", 16)) * 2, int(cfg["hilos"]) * 2)
         adaptador = requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=conexiones)
         self.s.mount("https://", adaptador)
-        self.control = None  # ControlHilos del migrador en curso (si lo hay)
+        self.controles = []  # ControlHilos activos (descargas, búsqueda): todos se frenan ante un 429
         self.pausa_hasta = 0.0
         self.pausa_lock = threading.Lock()
         self.red_lock = threading.Lock()
@@ -429,8 +440,8 @@ class Graph:
         except ValueError:
             seg = 30
         seg = max(5, min(seg, 900))
-        if self.control:
-            self.control.limitado()
+        for c in self.controles:
+            c.limitado()
         with self.pausa_lock:
             nuevo = time.time() + seg
             if nuevo > self.pausa_hasta:
@@ -497,8 +508,9 @@ class Graph:
             sc = r.status_code
             if sc < 400:
                 # SharePoint envía RateLimit-* cuando ya se consumió ~80% de la cuota: se frena antes del 429.
-                if self.control and "RateLimit-Remaining" in r.headers:
-                    self.control.precaucion()
+                if "RateLimit-Remaining" in r.headers:
+                    for c in self.controles:
+                        c.precaucion()
                 return r
             msg = self._mensaje(r)
             r.close()
@@ -679,6 +691,7 @@ class Stats:
         self.ok = self.omitidos = self.errores = self.eliminados = self.descubiertos = 0
         self.bytes = 0
         self.comprimidas = self.ahorro = 0
+        self.carpetas = 0
 
     def sumar(self, **kw):
         with self.lock:
@@ -766,9 +779,10 @@ class Compresor:
 
 # --------------------------------------------------------------------------- hilos adaptativos
 class ControlHilos:
-    """Cuántas descargas corren a la vez, ajustado solo (AIMD, como el control de congestión de TCP).
+    """Cuántas peticiones corren a la vez, ajustado solo (AIMD, como el control de congestión de TCP).
+    Se usa uno para las descargas y otro para la búsqueda de carpetas: ambos gastan la misma cuota de SharePoint.
 
-    - Cada 15 s sin limitaciones (y con descargas terminando) sube 1 hilo, hasta el máximo.
+    - Cada 15 s sin limitaciones (y con trabajo terminando) sube 1, hasta el máximo.
     - Ante un 429/503 baja a la mitad: así no vuelve a chocar enseguida con el límite y se evitan pausas repetidas.
     - Si SharePoint avisa que se acerca al límite (cabecera RateLimit-*), baja 1 antes de que llegue la pausa.
     """
@@ -778,7 +792,8 @@ class ControlHilos:
     AGRUPAR_429 = 10       # 429 recibidos dentro de esta ventana cuentan como uno
     ESPACIO_PRECAUCION = 20
 
-    def __init__(self, inicial, minimo, maximo, auto=True):
+    def __init__(self, inicial, minimo, maximo, auto=True, nombre="descargas"):
+        self.nombre = nombre
         self.minimo = max(1, int(minimo))
         self.maximo = max(self.minimo, int(maximo))
         self.auto = auto
@@ -789,7 +804,6 @@ class ControlHilos:
         self.cond = threading.Condition()
         self.ultimo_cambio = time.time()
         self.ultima_limitacion = 0.0
-        self.terminadas = 0
 
     def adquirir(self, stop):
         with self.cond:
@@ -802,15 +816,21 @@ class ControlHilos:
     def liberar(self):
         with self.cond:
             self.activos -= 1
-            self.terminadas += 1
-            ahora_ = time.time()
-            if (self.auto and self.limite < self.maximo and self.terminadas >= 1
-                    and ahora_ - self.ultimo_cambio >= self.SUBIR_CADA and ahora_ - self.ultima_limitacion >= self.CALMA):
-                self.limite += 1
-                self.ultimo_cambio = ahora_
-                self.terminadas = 0
-                log.info(f"[HILOS] SharePoint responde bien: subo a {self.limite} descargas simultáneas.")
+            self._quizas_subir()
             self.cond.notify_all()
+
+    def exito(self):
+        """Una petición terminó bien (para controles que no usan adquirir/liberar)."""
+        with self.cond:
+            self._quizas_subir()
+
+    def _quizas_subir(self):
+        ahora_ = time.time()
+        if (self.auto and self.limite < self.maximo and ahora_ - self.ultimo_cambio >= self.SUBIR_CADA
+                and ahora_ - self.ultima_limitacion >= self.CALMA):
+            self.limite += 1
+            self.ultimo_cambio = ahora_
+            log.info(f"[HILOS] SharePoint responde bien: {self.nombre} sube a {self.limite} a la vez.")
 
     def limitado(self):
         with self.cond:
@@ -822,7 +842,7 @@ class ControlHilos:
             if self.auto and self.limite > self.minimo:
                 self.limite = max(self.minimo, self.limite // 2)
                 self.ultimo_cambio = ahora_
-                log.warning(f"[HILOS] Limitación de SharePoint: bajo a {self.limite} descargas simultáneas.")
+                log.warning(f"[HILOS] Limitación de SharePoint: {self.nombre} baja a {self.limite} a la vez.")
 
     def precaucion(self):
         with self.cond:
@@ -833,7 +853,7 @@ class ControlHilos:
             if self.limite > self.minimo:
                 self.limite -= 1
                 self.ultimo_cambio = ahora_
-                log.info(f"[HILOS] SharePoint avisa que se acerca al límite: bajo a {self.limite} para evitar la pausa.")
+                log.info(f"[HILOS] SharePoint avisa que se acerca al límite: {self.nombre} baja a {self.limite}.")
 
 
 # --------------------------------------------------------------------------- migrador
@@ -858,7 +878,9 @@ class Migrador:
                                  key=lambda x: len(x[1]), reverse=True)
         self.control = ControlHilos(cfg["hilos"], cfg.get("hilos_min", 2), cfg.get("hilos_max", 16),
                                     cfg.get("hilos_auto", True))
-        graph.control = self.control
+        self.control_lista = ControlHilos(min(3, cfg.get("hilos_listado", 6)), 1, cfg.get("hilos_listado", 6),
+                                          cfg.get("hilos_auto", True), nombre="búsqueda de carpetas")
+        graph.controles = [self.control, self.control_lista]
         # El pool tiene tantos hilos como el máximo; ControlHilos decide cuántos descargan a la vez.
         self.pool = ThreadPoolExecutor(self.control.maximo, thread_name_prefix="desc")
         self.cupo = threading.BoundedSemaphore(self.control.maximo * 3)
@@ -981,7 +1003,9 @@ class Migrador:
         en_filtro = lambda r: coincide_filtro(r, self.filtro)  # noqa: E731
         for iid, r, hijos, error in recorrer_paralelo(self.g, drive_id, item_id, ruta,
                                                       self.cfg.get("hilos_listado", 6),
-                                                      entrar=lambda sub: True, con_url=en_filtro, stop=self.stop):
+                                                      entrar=lambda sub: True, con_url=en_filtro, stop=self.stop,
+                                                      control=self.control_lista):
+            self.stats.sumar(carpetas=1)
             if isinstance(error, NoEncontrado):
                 log.warning(f"La carpeta '{r}' ya no existe en SharePoint.")
                 self.db.carpeta_ok(drive_id, iid)
@@ -1225,7 +1249,8 @@ class Migrador:
             cola = len(self.futuros)
         imgs = f" | imágenes comprimidas {s.comprimidas} (ahorro {fmt_bytes(s.ahorro)})" if self.compresor else ""
         return (f"OK {s.ok} | omitidos {s.omitidos} | errores {s.errores} | descubiertos {s.descubiertos} | "
-                f"en cola {cola} | hilos {self.control.activos}/{self.control.limite} | "
+                f"en cola {cola} | carpetas revisadas {s.carpetas} | "
+                f"hilos {self.control.activos}/{self.control.limite} (búsqueda {self.control_lista.limite}) | "
                 f"{fmt_bytes(s.bytes)} a {fmt_bytes(vel)}/s | {fmt_duracion(trans)}{imgs}")
 
     def _monitor(self):
@@ -1451,6 +1476,8 @@ def buscar_carpetas_filtro(g, sel, filtro, hilos=8):
     Ctrl+C detiene la búsqueda y devuelve lo encontrado hasta ese momento."""
     encontradas = []
     revisadas = 0
+    control = ControlHilos(3, 1, hilos, nombre="búsqueda de carpetas")
+    g.controles = [control]
     try:
         for s in sel:
             if coincide_filtro(s["ruta"], filtro):
@@ -1458,7 +1485,8 @@ def buscar_carpetas_filtro(g, sel, filtro, hilos=8):
                 continue
             no_entrar = lambda sub: not coincide_filtro(sub.rsplit("/", 1)[-1], filtro)  # noqa: E731
             for _, ruta, hijos, error in recorrer_paralelo(g, s["drive_id"], s["item_id"], s["ruta"], hilos,
-                                                           entrar=no_entrar, con_url=lambda r: False):
+                                                           entrar=no_entrar, con_url=lambda r: False,
+                                                           control=control):
                 revisadas += 1
                 if error is not None:
                     print(f"\n  No se pudo revisar '{ruta}': {error}")
@@ -1702,7 +1730,8 @@ def ejecutar_trabajo(trabajo, cfg, solo_fallidos=False):
         finally:
             db.cerrar()
         if detenido:
-            log.warning(f"Detenido. Para reanudar:  python sp_migrar.py --trabajo {trabajo['nombre']}")
+            programa = "SP-Migrar.exe" if getattr(sys, "frozen", False) else "python sp_migrar.py"
+            log.warning(f"Detenido. Para reanudar: menú opción 2, o  {programa} --trabajo {trabajo['nombre']}")
             return 130
         return 2 if pendientes else 0
     except Detenido:

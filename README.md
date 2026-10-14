@@ -249,6 +249,18 @@ Por eso el programa ajusta los hilos solo:
 15:02:31 INFO    [ESTADO] OK 1840 | ... | hilos 10/10 | 9.71 GB a 42.30 MB/s
 ```
 
+**La búsqueda de carpetas también se ajusta sola.** Al usar un filtro como `2026`, revisar miles de carpetas gasta la misma cuota que las descargas. Por eso la búsqueda tiene su propio control: empieza revisando 3 carpetas a la vez, sube hasta `hilos_listado` y baja a 1 ante un 429. Además recorre **en profundidad** (cliente por cliente hasta el fondo), así la primera carpeta `2026` aparece enseguida y la descarga empieza ya.
+
+En una prueba con un SharePoint que solo aceptaba 2 listados a la vez:
+
+| | Búsqueda fija (6 a la vez) | Búsqueda automática |
+|---|---|---|
+| Tiempo total | 397 s | **29 s** |
+| Avisos 429 | 304 | **5** |
+| Primera descarga | a los 35 s | **a los 5 s** |
+
+La línea de estado muestra cuántas carpetas lleva revisadas: `carpetas revisadas 1240 | hilos 3/4 (búsqueda 2)`.
+
 **Otras optimizaciones:**
 - **Menos peticiones:** el enlace de descarga viene en el mismo listado de la carpeta, así que no hay una petición extra por archivo. Con muchos archivos pequeños es la mitad de peticiones.
 - **Tráfico identificado:** se envía un `User-Agent`, como recomienda Microsoft, para que el tráfico tenga prioridad al aplicar límites.
